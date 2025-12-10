@@ -58,6 +58,8 @@ from vllm.v1.sample.logits_processor import LogitsProcessor
 if TYPE_CHECKING:
     from vllm.v1.metrics.reader import Metric
 
+from vllm.v1.core.sched.future_usage import FutureUsageMap
+
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
@@ -1498,6 +1500,8 @@ class LLM:
             it = tqdm_func(it, desc="Adding requests")
 
         model_config = self.llm_engine.model_config
+
+        #FutureUsageMap.compute_future_usage(it, tokenizer=self.get_tokenizer())
 
         for i, prompt in enumerate(it):
 
