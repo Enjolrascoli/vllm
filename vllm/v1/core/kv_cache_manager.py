@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
+import os
 
 logger = init_logger(__name__)
 
@@ -285,8 +286,20 @@ class KVCacheManager:
         self.coordinator.save_new_computed_blocks(request.request_id,
                                                   new_computed_block_list)
 
+        # Update next_use for new computed blocks
+        current_token_idx = request.num_computed_tokens  # Starting index for new computed blocks
+        for block in new_computed_block_list[0]:
+            block.next_use = (request.request_id, current_token_idx)
+            current_token_idx += self.block_size
+
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id, num_tokens_need_slot, num_encoder_tokens)
+        
+        # Update next_use for new blocks
+        current_token_idx = num_computed_tokens  # Starting index for new blocks
+        for block in new_blocks[0]:
+            block.next_use = (request.request_id, current_token_idx)
+            current_token_idx += self.block_size
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

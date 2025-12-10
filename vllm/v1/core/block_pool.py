@@ -15,6 +15,13 @@ from vllm.v1.core.kv_cache_utils import (BlockHash, BlockHashWithGroupId,
                                          maybe_convert_block_hash)
 from vllm.v1.request import Request
 
+import os
+from vllm.v1.core.kv_cache_utils import (FreeKVCacheBlockQueueBelady)
+from vllm.v1.core.sched.future_usage import FutureUsageMap
+from vllm.utils import cprofile
+from collections import defaultdict
+
+
 logger = init_logger(__name__)
 
 
@@ -145,7 +152,7 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = FreeKVCacheBlockQueueBelady(self.blocks) if os.getenv("VLLM_BELADY") == 1 else FreeKVCacheBlockQueue(self.blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = \
@@ -159,6 +166,9 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+        
+        self.prof_counters: dict[str, int] = defaultdict(int)
+        self.prof_times: dict[str, float] = defaultdict(float)
 
     def get_cached_block(
             self, block_hash: BlockHash,
@@ -174,6 +184,7 @@ class BlockPool:
         Returns:
             The cached blocks if exists, or None.
         """
+        self.prof_counters["get_cached_block"] += 1
         cached_blocks = []
         for group_id in kv_cache_group_ids:
             block_hash_with_group_id = make_block_hash_with_group_id(
@@ -181,7 +192,9 @@ class BlockPool:
             block = self.cached_block_hash_to_block.get_one_block(
                 block_hash_with_group_id)
             if not block:
+                self.prof_counters["get_cached_block_misses"] += 1
                 return None
+            self.prof_counters["get_cached_block_hits"] += 1
             cached_blocks.append(block)
         return cached_blocks
 
@@ -254,6 +267,7 @@ class BlockPool:
                     medium=MEDIUM_GPU,
                 ))
 
+    @cprofile("get_new_blocks_belady.prof" if os.getenv("VLLM_BELADY") == "1" else "get_new_blocks_lru.prof")
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -283,6 +297,7 @@ class BlockPool:
                 block.ref_cnt += 1
         return ret
 
+    #@cprofile("maybe_evict_belady.prof" if os.getenv("VLLM_BELADY") == "1" else "maybe_evict_lru.prof")
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
@@ -335,6 +350,7 @@ class BlockPool:
                     self.free_block_queue.remove(block)
                 block.ref_cnt += 1
 
+    @cprofile("free_blocks_belady.prof" if os.getenv("VLLM_BELADY") == "1" else "free_blocks_lru.prof")
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
@@ -347,6 +363,7 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+            block.next_use = FutureUsageMap.get_next_use(block.next_use)
         self.free_block_queue.append_n([
             block for block in blocks_list
             if block.ref_cnt == 0 and not block.is_null

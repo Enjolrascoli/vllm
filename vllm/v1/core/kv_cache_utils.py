@@ -4,6 +4,9 @@
 
 import copy
 import os
+import heapq
+from sortedcontainers import SortedDict
+from vllm.utils import cprofile
 from collections import defaultdict, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -177,6 +180,8 @@ class KVCacheBlock:
     # when the block is full and cached.
     _block_hash: Optional[BlockHashWithGroupId] = None
 
+    next_use: Optional[tuple[int, int]] = None
+
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
     prev_free_block: Optional["KVCacheBlock"] = None
@@ -211,6 +216,94 @@ class KVCacheBlock:
                 f"_block_hash={self._block_hash!r}, "
                 f"prev_free_block={prev_block_id}, "
                 f"next_free_block={next_block_id})")
+
+
+class FreeKVCacheBlockPriorityQueue:
+    """This class organizes a list of KVCacheBlock objects to a priority queue
+    of free blocks. We implement this class instead of using Python builtin
+    priority queue to support removing a block in the middle of the queue
+    in O(1) time.
+    """
+
+    _REMOVED = object()
+
+    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+        self._heap: list[list[Any]] = []
+        self._entry_finder: dict[int, list[Any]] = {}
+        self._counter = 0
+        self.num_free_blocks = len(blocks)
+        
+        for block in blocks:
+            self.append(block)
+
+    def __len__(self) -> int:
+        return self.num_free_blocks
+
+    def _priority(self, block: KVCacheBlock) -> tuple[float, str, int]:
+        next_use = block.next_use
+        if next_use is None:
+            return (float("-inf"), "", block.block_id)
+        session, position = next_use
+        return (-float(position), session, block.block_id)
+
+    def append(self, block: KVCacheBlock) -> None:
+        if block.block_id in self._entry_finder:
+            raise RuntimeError(
+                f"Block {block.block_id} is already tracked by the priority queue"
+            )
+        entry = [self._priority(block), self._counter, block]
+        self._counter += 1
+        self._entry_finder[block.block_id] = entry
+        heapq.heappush(self._heap, entry)
+        block.prev_free_block = None
+        block.next_free_block = None
+        self.num_free_blocks += 1
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        for block in blocks:
+            self.append(block)
+
+    def _pop_entry(self) -> KVCacheBlock:
+        while self._heap:
+            priority, _, block = heapq.heappop(self._heap)
+            if block is self._REMOVED:
+                continue
+            entry = self._entry_finder.pop(block.block_id, None)
+            if entry is None:
+                continue
+            entry[2] = self._REMOVED
+            self.num_free_blocks -= 1
+            return block
+        raise ValueError("No free blocks available")
+
+    def popleft(self) -> KVCacheBlock:
+        """Pop the block with the largest next use (Belady's optimal choice)."""
+        return self._pop_entry()
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n, (
+            f"num_free_blocks ({self.num_free_blocks}) is out of sync "
+            "with the free list.")
+        return [self.popleft() for _ in range(n)]
+
+    def remove(self, block: KVCacheBlock) -> None:
+        entry = self._entry_finder.pop(block.block_id, None)
+        if entry is None or entry[2] is self._REMOVED:
+            raise RuntimeError(f"remove() called on an invalid block: {block}")
+        entry[2] = self._REMOVED
+        self.num_free_blocks -= 1
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        live_entries: list[tuple[tuple[float, str, int], KVCacheBlock]] = []
+        for entry in self._entry_finder.values():
+            block = entry[2]
+            if block is self._REMOVED:
+                continue
+            live_entries.append((entry[0], block))
+        live_entries.sort()
+        return [block for _, block in live_entries]
 
 
 class FreeKVCacheBlockQueue:
@@ -415,6 +508,154 @@ class FreeKVCacheBlockQueue:
             ret.append(curr_block)
             curr_block = curr_block.next_free_block
         return ret
+
+
+class FreeKVCacheBlockQueueBelady(FreeKVCacheBlockQueue):
+    '''
+    This class extends FreeKVCacheBlockQueue to order free blocks
+    by next use in ascending order for Belady's optimal eviction policy.
+    
+    list layout (sorted by next_use):
+    
+    ----------------------------------------------------------------
+    | < None > | (12, 21), (12, 20), ... | (10, 18), (10, 17), ... |
+    ----------------------------------------------------------------
+                 |<head>|                  |<head>| 
+    '''
+
+    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+        super().__init__(blocks)
+        self.head_map = SortedDict[int, KVCacheBlock]() # record the first block of each request_id in the list
+        
+    def get_insertion_point(self, block: KVCacheBlock) -> KVCacheBlock:
+        """Get the insertion point for the given block based on its next_use.
+        The new block should be inserted before the returned block.
+
+        Args:
+            block: The block to find the insertion point for.
+        """
+        if self.fake_free_list_head.next_free_block is None:
+            raise RuntimeError(
+                "next_free_block of fake_free_list_head should always exist")
+        first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
+        last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
+        
+        # block.next_use is None -> directly append to the start
+        # first_block.next_use < block.next_use -> directly append to the start
+        # last_block.next_use > block.next_use -> append to the end
+        # in between -> get the position of head of its request_id, and insert before it
+
+        # Find the correct position to insert the block
+        req_id = block.next_use[0] if block.next_use is not None else None
+            
+        if ((first_block.next_use is not None and req_id > first_block.next_use[0]) or (req_id is None)):
+            return first_block
+        elif (last_block.next_use is None or 
+                req_id < last_block.next_use[0]):
+            return self.fake_free_list_tail
+        else:
+            insertion_idx = self.head_map.bisect_left(req_id)
+            _, insertion_point_block = self.head_map.peekitem(insertion_idx)
+            return insertion_point_block
+
+    @cprofile("append_belady.prof")
+    def append(self, block: KVCacheBlock) -> None:
+        """Put a block back into the free list sorted by next_use and increase
+        num_free_blocks by 1.
+
+        Args:
+            block: The block to append.
+        """
+        if self.fake_free_list_tail.prev_free_block is None:
+            raise RuntimeError(
+                "prev_free_block of fake_free_list_tail should always exist")
+        first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
+        
+        insertion_point = self.get_insertion_point(block)
+
+        prev_block = insertion_point.prev_free_block
+        assert prev_block is not None
+        prev_block.next_free_block = block
+        block.prev_free_block = prev_block
+
+        block.next_free_block = insertion_point
+        insertion_point.prev_free_block = block
+
+        self.num_free_blocks += 1
+        if block.next_use is not None:
+            self.head_map[block.next_use[0]] = block
+
+        return
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Put a list of blocks back into the free list
+
+        Args:
+            blocks: The blocks to append.
+        """
+        if len(blocks) == 0:
+            return
+
+        last_block = self.fake_free_list_tail.prev_free_block
+        assert last_block is not None, (
+            "prev_free_block of fake_free_list_tail should always exist")
+        # Add inter-connections between consecutive blocks
+        
+        req_table = dict()
+
+        for block in blocks:
+            req_id = block.next_use[0] if block.next_use is not None else None
+            if req_id not in req_table:
+                req_table[req_id] = (block, block)
+            tail_block = req_table[req_id][1]
+            tail_block.next_free_block = block
+            block.prev_free_block = tail_block
+            req_table[req_id] = (req_table[req_id][0], block)
+
+        for req_id in req_table:
+            head_block, tail_block = req_table[req_id]
+            if req_id is None:
+                insertion_point = self.fake_free_list_head.next_free_block
+                prev_block = self.fake_free_list_head
+            else:
+                insertion_point = self.get_insertion_point(head_block)
+                prev_block = insertion_point.prev_free_block
+                assert prev_block is not None
+            prev_block.next_free_block = head_block
+            head_block.prev_free_block = prev_block
+
+            tail_block.next_free_block = insertion_point
+            insertion_point.prev_free_block = tail_block
+            
+            if req_id is not None:
+                self.head_map[req_id] = head_block
+
+        self.num_free_blocks += len(blocks)
+        
+    def remove(self, block: KVCacheBlock) -> None:
+        """Remove a block in the free list and reduce num_free_blocks by 1.
+
+        Args:
+            block: The block to remove.
+        """
+        if block.prev_free_block is None or block.next_free_block is None:
+            # This should not happen if the block is from the free list.
+            # It indicates a bug in the caller's logic.
+            raise RuntimeError(f"remove() called on an invalid block: {block}")
+
+        # Link the previous block to the next block.
+        block.prev_free_block.next_free_block = block.next_free_block
+        # Link the next block to the previous block.
+        block.next_free_block.prev_free_block = block.prev_free_block
+
+        # Remove the block from the linked list.
+        if (block.next_use is not None and block.prev_free_block.next_use[0] != block.next_use[0]): # first block in the queue
+            if (block.next_free_block.next_use[0] == block.next_use[0]): # not the last block of the request_id
+                self.head_map[block.next_use[0]] = block.next_free_block  # update head_map to next block
+            else:
+                self.head_map.pop(block.next_use[0], None) # last block of the request_id, remove from head_map
+        block.prev_free_block = block.next_free_block = None
+        self.num_free_blocks -= 1
 
 
 def need_extra_keys(request: Request) -> bool:
