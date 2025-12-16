@@ -513,7 +513,7 @@ class FreeKVCacheBlockQueue:
 class FreeKVCacheBlockQueueBelady(FreeKVCacheBlockQueue):
     '''
     This class extends FreeKVCacheBlockQueue to order free blocks
-    by next use in ascending order for Belady's optimal eviction policy.
+    by next use in descending order for Belady's optimal eviction policy.
     
     list layout (sorted by next_use):
     
@@ -526,6 +526,79 @@ class FreeKVCacheBlockQueueBelady(FreeKVCacheBlockQueue):
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
         super().__init__(blocks)
         self.head_map = SortedDict[int, KVCacheBlock]() # record the first block of each request_id in the list
+        self._debug_counter = 0
+
+    def popleft(self) -> KVCacheBlock:
+        # Peek at the block to be popped to update head_map
+        block_to_pop = self.fake_free_list_head.next_free_block
+        
+        # We need to check if block_to_pop is valid before accessing its properties
+        # super().popleft() does this check, but we need to do it before calling super()
+        if (block_to_pop is None or block_to_pop is self.fake_free_list_tail):
+             # This will raise ValueError as expected
+             return super().popleft()
+
+        # Update head_map
+        if block_to_pop.next_use is not None:
+             next_block = block_to_pop.next_free_block
+             if (next_block is not None and next_block.next_use is not None and next_block.next_use[0] == block_to_pop.next_use[0]):
+                 self.head_map[block_to_pop.next_use[0]] = next_block
+             else:
+                 self.head_map.pop(block_to_pop.next_use[0], None)
+
+        block = super().popleft()
+        self._debug_counter += 1
+        # Print every 50th eviction to avoid spamming logs, but frequent enough to see patterns
+        #if self._debug_counter % 50 == 0:
+        #     print(f"[Belady-Debug] Evicting block {block.block_id} | next_use={block.next_use}")
+        return block
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        self.num_free_blocks -= n
+
+        curr_block = self.fake_free_list_head.next_free_block
+        # Pop n blocks from the head of the list
+        ret = []
+        for i in range(n):
+            assert curr_block is not None
+            ret.append(curr_block)
+            last_block = curr_block
+            curr_block = curr_block.next_free_block
+            # Reset prev_free_block and next_free_block of all popped blocks
+            last_block.prev_free_block = None
+            last_block.next_free_block = None
+            
+            # Update head_map
+            if last_block.next_use is not None:
+                req_id = last_block.next_use[0]
+                
+                # Check if the current block belongs to a different request (or end of queue)
+                is_end_of_request = (
+                    curr_block is None or 
+                    curr_block is self.fake_free_list_tail or 
+                    curr_block.next_use is None or 
+                    curr_block.next_use[0] != req_id
+                )
+                
+                if is_end_of_request:
+                    # We are removing the last block of this request in the queue.
+                    # Regardless of whether we stop popping here or continue, 
+                    # this request no longer has blocks in the queue.
+                    self.head_map.pop(req_id, None)
+                elif i == n - 1:
+                    # The next block (which is not popped) becomes the new head.
+                    self.head_map[req_id] = curr_block
+
+        if curr_block is not None:
+            # The queue is not empty, connect the fake head to
+            # the new first block.
+            self.fake_free_list_head.next_free_block = curr_block
+            curr_block.prev_free_block = self.fake_free_list_head
+        return ret
+
         
     def get_insertion_point(self, block: KVCacheBlock) -> KVCacheBlock:
         """Get the insertion point for the given block based on its next_use.
@@ -554,7 +627,7 @@ class FreeKVCacheBlockQueueBelady(FreeKVCacheBlockQueue):
                 req_id < last_block.next_use[0]):
             return self.fake_free_list_tail
         else:
-            insertion_idx = self.head_map.bisect_left(req_id)
+            insertion_idx = self.head_map.bisect_right(req_id) - 1
             _, insertion_point_block = self.head_map.peekitem(insertion_idx)
             return insertion_point_block
 
@@ -649,8 +722,8 @@ class FreeKVCacheBlockQueueBelady(FreeKVCacheBlockQueue):
         block.next_free_block.prev_free_block = block.prev_free_block
 
         # Remove the block from the linked list.
-        if (block.next_use is not None and block.prev_free_block.next_use[0] != block.next_use[0]): # first block in the queue
-            if (block.next_free_block.next_use[0] == block.next_use[0]): # not the last block of the request_id
+        if (block.next_use is not None and (block.prev_free_block.next_use is None or block.prev_free_block.next_use[0] != block.next_use[0])): # first block in the queue
+            if (block.next_free_block.next_use is not None and block.next_free_block.next_use[0] == block.next_use[0]): # not the last block of the request_id
                 self.head_map[block.next_use[0]] = block.next_free_block  # update head_map to next block
             else:
                 self.head_map.pop(block.next_use[0], None) # last block of the request_id, remove from head_map

@@ -152,7 +152,7 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueueBelady(self.blocks) if os.getenv("VLLM_BELADY") == 1 else FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = FreeKVCacheBlockQueueBelady(self.blocks) if os.getenv("VLLM_BELADY") == "1" else FreeKVCacheBlockQueue(self.blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = \
@@ -363,7 +363,8 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-            block.next_use = FutureUsageMap.get_next_use(block.next_use)
+            if (block.ref_cnt == 0):
+                block.next_use = FutureUsageMap.get_next_use(block.next_use)
         self.free_block_queue.append_n([
             block for block in blocks_list
             if block.ref_cnt == 0 and not block.is_null
@@ -391,7 +392,11 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
-
+            block.next_use = None
+            
+        if isinstance(self.free_block_queue, FreeKVCacheBlockQueueBelady):
+            self.free_block_queue.head_map.clear()
+        
         logger.info("Successfully reset prefix cache")
 
         if self.enable_kv_cache_events:
