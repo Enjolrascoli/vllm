@@ -9,6 +9,7 @@ import argparse, datetime as dt, hashlib, itertools, json, pathlib, random, sys,
 import tiktoken
 from transformers import AutoTokenizer
 import numpy as np
+import os
 
 SECONDS_PER_OUTPUT_TOKEN = 0.05   # 20 tokens/s  – change if you like
 TOKEN_PER_SECOND = 1000
@@ -16,9 +17,10 @@ RNG = random.Random(12345)
 
 
 def build_trace(in_file: pathlib.Path, out_file: pathlib.Path,
-                max_conv: int, request_rate: float, max_turn: int):
+                max_conv: int, request_rate: float, max_turn: int, turn_gap: float, model: str):
     data = json.loads(in_file.read_text())
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B") 
+    tokenizer = AutoTokenizer.from_pretrained(model) 
+    os.makedirs("trace", exist_ok=True)
     
     # keep only valid multi-turn dialogs
     convs = []
@@ -32,12 +34,12 @@ def build_trace(in_file: pathlib.Path, out_file: pathlib.Path,
     # global Poisson process for *first* user message of each conversation
     t0 = time.time()
     next_conv = 0.0
-    MIN_GAP = 30                     # seconds between parent and child
+    MIN_GAP = turn_gap                     # seconds between parent and child
     traces = []
     
     turn_rate = request_rate / 10
 
-    for conv in convs:
+    for i, conv in enumerate(convs):
         next_turn = next_conv
         # cumulative chat history in OpenAI format
         # history = [{"role": "system", "content": "You are a helpful assistant."}]
@@ -49,10 +51,6 @@ def build_trace(in_file: pathlib.Path, out_file: pathlib.Path,
             if role == "user":          # we only *request* the model when user speaks
                 #prompt_txt = "\n".join(f"{h['role']}: {h['content']}" for h in history)
                 prompt = msg["value"]
-
-                if (len(tokenizer.encode(prev_assistant_txt)) > tokenizer.model_max_length - 100):
-                    # truncate history if too long
-                    prompt = remove_prefix(prompt, prev_assistant_txt)
 
                 parent_chat_id = f"{conv['id']}_turn{turn_idx-2}" if turn_idx > 0 else ""
                 chat_id = f"{conv['id']}_turn{turn_idx}"
@@ -96,7 +94,8 @@ if __name__ == "__main__":
     ap.add_argument("--output", type=pathlib.Path, default="sharegpt_multiturn_trace.jsonl")
     ap.add_argument("--max-conversations", type=int, default=1000)
     ap.add_argument("--max-turn", type=int, default=10)
-    ap.add_argument("--request_rate", type=float, default=4.0, help="Average conversation-start rate")
-    ap.add_argument("-m", "--model", type=str, default="Qwen/Qwen3-8B", help="Path of the LLM model")
+    ap.add_argument("--request-rate", type=float, default=4.0, help="Average conversation-start rate")
+    ap.add_argument("--turn-gap", type=float, default=10.0, help="Average conversation-start rate")
+    ap.add_argument("-m", "--model", type=str, default="Qwen/Qwen3-1.7B", help="Path of the LLM model")
     args = ap.parse_args()
-    build_trace(args.input, args.output, args.max_conversations, args.request_rate, args.max_turn)
+    build_trace(args.input, args.output, args.max_conversations, args.request_rate, args.max_turn, args.turn_gap, args.model)
