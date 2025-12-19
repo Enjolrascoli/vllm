@@ -364,7 +364,7 @@ class BlockPool:
         for block in blocks_list:
             block.ref_cnt -= 1
             if (block.ref_cnt == 0):
-                block.next_use = FutureUsageMap.get_next_use(block.next_use)
+                block.next_use = FutureUsageMap.get_next_use(block.next_use) if block.block_hash is not None else None
         self.free_block_queue.append_n([
             block for block in blocks_list
             if block.ref_cnt == 0 and not block.is_null
